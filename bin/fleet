@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""fleet: a small manager for your macOS background services (user LaunchAgents).
+
+Services live in a JSON config (~/.config/fleet/services.json, or $FLEET_CONFIG).
+Every command that takes targets accepts service names, group names, or "all";
+with no targets it acts on every service.
+
+  fleet [status] [target...]       state, pid, HTTP code and URL
+  fleet ls                         terse list of configured services
+  fleet up|down [target...]        start / stop (down stays off across logins)
+  fleet restart [target...]        kickstart -k a loaded service
+  fleet reinstall [target...]      regenerate (or re-run the installer for) the plist, then start
+  fleet logs <target...> [-f]      tail the log(s)
+  fleet url <target...>            print the service URL
+  fleet open <target...>           open the URL in the browser
+  fleet add <name> [--label L] [--port N] [--probe /p] [--log PATH] [--group G]
+            [--url U] [--url-from-log REGEX] [--cwd DIR] [--env K=V]... [--no-keep-alive]
+            (--install "<cmd>" | -- <argv...>)
+  fleet remove <name> [--keep-plist]
+  fleet adopt <label> [--name N] [--port N] [--probe /p] [--log PATH] [--group G] [--install "<cmd>"]
+  fleet edit                       open the config in $EDITOR, then validate it
+
+Environment: FLEET_CONFIG (config path), FLEET_AGENTS_DIR (LaunchAgents dir),
+FLEET_LAUNCHCTL (launchctl binary), FLEET_SETTLE (seconds to wait before
+printing status after up/restart; default 2).
+"""
+import json
+import os
+import plistlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+RESERVED = {"all"}
+SERVICE_KEYS = {"name", "label", "port", "probe", "url", "url_from_log", "log", "group", "adopt", "run"}
+ADOPT_KEYS = {"install", "plist"}
+RUN_KEYS = {"argv", "cwd", "env", "keepAlive"}
+CARRIED_ENV = ("PATH", "HOME", "USER", "LOGNAME")
+
+
+class FleetError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- environment
+
+def config_path():
+    return os.path.expanduser(os.environ.get("FLEET_CONFIG") or "~/.config/fleet/services.json")
+
+
+def agents_dir():
+    return os.path.expanduser(os.environ.get("FLEET_AGENTS_DIR") or "~/Library/LaunchAgents")
+
+
+def launchctl_bin():
+    return os.environ.get("FLEET_LAUNCHCTL") or "/bin/launchctl"
+
+
+def domain():
+    return "gui/%d" % os.getuid()
+
+
+def settle():
+    try:
+        return float(os.environ.get("FLEET_SETTLE", "2"))
+    except ValueError:
+        return 2.0
+
+
+def expand(p):
+    return os.path.expandvars(os.path.expanduser(p)) if isinstance(p, str) else p
+
+
+# --------------------------------------------------------------------- config
+
+def validate(cfg):
+    """Return a list of human-readable problems with a parsed config (empty when valid)."""
+    errs = []
+    if not isinstance(cfg, dict):
+        return ["top level must be an object with a \"services\" array"]
+    extra = set(cfg) - {"version", "services"}
+    if extra:
+        errs.append("unknown top-level key(s): %s" % ", ".join(sorted(extra)))
+    svcs = cfg.get("services")
+    if not isinstance(svcs, list):
+        return errs + ["\"services\" must be an array"]
+    names, labels, groups = {}, {}, set()
+    for i, s in enumerate(svcs):
+        where = "services[%d]" % i
+        if not isinstance(s, dict):
+            errs.append("%s: must be an object" % where)
+            continue
+        name = s.get("name")
+        if isinstance(name, str):
+            where = "service '%s'" % name
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            errs.append("%s: \"name\" must be a string of letters, digits, '.', '_' or '-'" % where)
+        elif name in RESERVED:
+            errs.append("%s: \"%s\" is reserved" % (where, name))
+        elif name in names:
+            errs.append("%s: duplicate name" % where)
+        else:
+            names[name] = i
+        extra = set(s) - SERVICE_KEYS
+        if extra:
+            errs.append("%s: unknown key(s): %s" % (where, ", ".join(sorted(extra))))
+        label = s.get("label")
+        if not isinstance(label, str) or not LABEL_RE.match(label):
+            errs.append("%s: \"label\" must be a LaunchAgent label like local.myservice" % where)
+        elif label in labels:
+            errs.append("%s: label '%s' is also used by '%s'" % (where, label, labels[label]))
+        else:
+            labels[label] = name
+        if "port" in s and (not isinstance(s["port"], int) or isinstance(s["port"], bool)
+                            or not 1 <= s["port"] <= 65535):
+            errs.append("%s: \"port\" must be an integer 1-65535" % where)
+        if "probe" in s and (not isinstance(s["probe"], str) or not s["probe"].startswith("/")):
+            errs.append("%s: \"probe\" must be a path starting with '/'" % where)
+        for k in ("url", "log"):
+            if k in s and (not isinstance(s[k], str) or not s[k]):
+                errs.append("%s: \"%s\" must be a non-empty string" % (where, k))
+        if "url_from_log" in s:
+            rx = s["url_from_log"]
+            if not isinstance(rx, str) or not rx:
+                errs.append("%s: \"url_from_log\" must be a regex string" % where)
+            else:
+                try:
+                    re.compile(rx)
+                except re.error as e:
+                    errs.append("%s: \"url_from_log\" is not a valid regex: %s" % (where, e))
+                if "log" not in s:
+                    errs.append("%s: \"url_from_log\" needs \"log\"" % where)
+        if "group" in s:
+            g = s["group"]
+            if not isinstance(g, str) or not NAME_RE.match(g):
+                errs.append("%s: \"group\" must be a simple name" % where)
+            elif g in RESERVED:
+                errs.append("%s: group \"%s\" is reserved" % (where, g))
+            else:
+                groups.add(g)
+        has_adopt, has_run = "adopt" in s, "run" in s
+        if has_adopt == has_run:
+            errs.append("%s: needs exactly one of \"adopt\" or \"run\"" % where)
+        if has_adopt:
+            a = s["adopt"]
+            if not isinstance(a, dict):
+                errs.append("%s: \"adopt\" must be an object (keys: install, plist)" % where)
+            else:
+                extra = set(a) - ADOPT_KEYS
+                if extra:
+                    errs.append("%s: adopt: unknown key(s): %s" % (where, ", ".join(sorted(extra))))
+                for k in ADOPT_KEYS:
+                    if k in a and (not isinstance(a[k], str) or not a[k]):
+                        errs.append("%s: adopt.%s must be a non-empty string" % (where, k))
+        if has_run:
+            r = s["run"]
+            if not isinstance(r, dict):
+                errs.append("%s: \"run\" must be an object (keys: argv, cwd, env, keepAlive)" % where)
+            else:
+                extra = set(r) - RUN_KEYS
+                if extra:
+                    errs.append("%s: run: unknown key(s): %s" % (where, ", ".join(sorted(extra))))
+                argv = r.get("argv")
+                if not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv):
+                    errs.append("%s: run.argv must be a non-empty array of non-empty strings" % where)
+                if "cwd" in r and (not isinstance(r["cwd"], str) or not r["cwd"]):
+                    errs.append("%s: run.cwd must be a non-empty string" % where)
+                if "env" in r and (not isinstance(r["env"], dict) or not all(
+                        isinstance(k, str) and k and isinstance(v, str) for k, v in r["env"].items())):
+                    errs.append("%s: run.env must be an object of string values" % where)
+                if "keepAlive" in r and not isinstance(r["keepAlive"], bool):
+                    errs.append("%s: run.keepAlive must be true or false" % where)
+    for g in sorted(groups & set(names)):
+        errs.append("group '%s' has the same name as a service" % g)
+    return errs
+
+
+def load_config(path=None, migrate=True):
+    path = path or config_path()
+    if not os.path.exists(path):
+        if not migrate:
+            raise FleetError("no config at %s" % path)
+        cfg = empty_config()
+        save_config(cfg, path)
+        sys.stderr.write("fleet: wrote %s with %d services (first run)\n" % (path, len(cfg["services"])))
+        return cfg
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except ValueError as e:
+        raise FleetError("%s is not valid JSON: %s" % (path, e))
+    errs = validate(cfg)
+    if errs:
+        raise FleetError("invalid config %s:\n  " % path + "\n  ".join(errs))
+    return cfg
+
+
+def save_config(cfg, path=None):
+    path = path or config_path()
+    errs = validate(cfg)
+    if errs:
+        raise FleetError("refusing to write an invalid config:\n  " + "\n  ".join(errs))
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".services.", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def empty_config():
+    """Fresh installs have no implicit services, discovery or topology import."""
+    return {"version": 1, "services": []}
+
+
+def find(cfg, name):
+    for s in cfg["services"]:
+        if s["name"] == name:
+            return s
+    return None
+
+
+def resolve(cfg, args):
+    """Expand service/group names (or "all") into service dicts, in config order, deduped."""
+    svcs = cfg["services"]
+    if not args:
+        return list(svcs)
+    picked = set()
+    for a in args:
+        if a == "all":
+            picked.update(s["name"] for s in svcs)
+            continue
+        hit = [s["name"] for s in svcs if s["name"] == a or s.get("group") == a]
+        if not hit:
+            groups = sorted({s["group"] for s in svcs if "group" in s})
+            raise FleetError("unknown service or group '%s' (services: %s; groups: %s)" % (
+                a, ", ".join(s["name"] for s in svcs) or "none", ", ".join(groups) or "none"))
+        picked.update(hit)
+    return [s for s in svcs if s["name"] in picked]
+
+
+# ---------------------------------------------------------------- per-service
+
+def plist_path(s):
+    a = s.get("adopt") or {}
+    if a.get("plist"):
+        return expand(a["plist"])
+    return os.path.join(agents_dir(), s["label"] + ".plist")
+
+
+def log_path(s):
+    return expand(s["log"]) if s.get("log") else None
+
+
+def base_url(s):
+    if s.get("url"):
+        return s["url"]
+    if s.get("port"):
+        return "http://127.0.0.1:%d/" % s["port"]
+    return ""
+
+
+def url_from_log(regex, path):
+    """Last match of regex in the log file (group 1 if the regex has one), else None."""
+    try:
+        with open(path, errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    last = None
+    for m in re.finditer(regex, text):
+        last = m
+    if last is None:
+        return None
+    return last.group(1) if last.re.groups else last.group(0)
+
+
+def service_url(s):
+    if s.get("url_from_log") and s.get("log"):
+        u = url_from_log(s["url_from_log"], log_path(s))
+        if u:
+            return u
+    return base_url(s)
+
+
+def build_plist(s, environ=None):
+    """The LaunchAgent dict for a `run` service."""
+    environ = os.environ if environ is None else environ
+    r = s["run"]
+    argv = [expand(x) if x.startswith("~") else x for x in r["argv"]]
+    if "/" not in argv[0]:
+        argv[0] = shutil.which(argv[0], path=environ.get("PATH")) or argv[0]
+    env = {k: environ[k] for k in CARRIED_ENV if environ.get(k)}
+    if "LOGNAME" not in env and environ.get("USER"):
+        env["LOGNAME"] = environ["USER"]
+    for k, v in (r.get("env") or {}).items():
+        env[k] = expand(v)
+    d = {"Label": s["label"], "ProgramArguments": argv}
+    if r.get("cwd"):
+        d["WorkingDirectory"] = expand(r["cwd"])
+    d["EnvironmentVariables"] = env
+    d["RunAtLoad"] = True
+    d["KeepAlive"] = r.get("keepAlive", True)
+    d["ProcessType"] = "Background"
+    if s.get("log"):
+        d["StandardOutPath"] = d["StandardErrorPath"] = log_path(s)
+    return d
+
+
+def render_plist(s, environ=None):
+    return plistlib.dumps(build_plist(s, environ), fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+def write_plist(s):
+    path = plist_path(s)
+    if s.get("log"):
+        os.makedirs(os.path.dirname(log_path(s)), exist_ok=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = render_plist(s)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".fleet.", suffix=".plist")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------ launchctl
+
+def lc(*args, quiet=True):
+    return subprocess.run([launchctl_bin()] + list(args), stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE if quiet else None, universal_newlines=True)
+
+
+def target(s):
+    return "%s/%s" % (domain(), s["label"])
+
+
+def lc_print(s):
+    p = lc("print", target(s))
+    return p.stdout if p.returncode == 0 else None
+
+
+def loaded(s):
+    return lc_print(s) is not None
+
+
+def pid_of(text):
+    m = re.search(r"^\tpid = (\d+)", text or "", re.M)
+    return m.group(1) if m else ""
+
+
+def ensure_installed(s):
+    path = plist_path(s)
+    if os.path.exists(path):
+        return
+    if "run" in s:
+        write_plist(s)
+        return
+    cmd = s["adopt"].get("install")
+    if not cmd:
+        raise FleetError("%s: plist %s is missing and the service has no install command" % (s["name"], path))
+    p = subprocess.run(["/bin/sh", "-c", cmd], stdout=subprocess.DEVNULL)
+    if p.returncode != 0:
+        raise FleetError("%s: install command failed (%d): %s" % (s["name"], p.returncode, cmd))
+    if not os.path.exists(path) and not loaded(s):
+        raise FleetError("%s: install command ran but %s does not exist" % (s["name"], path))
+
+
+def up(s):
+    ensure_installed(s)
+    lc("enable", target(s))
+    if not loaded(s):
+        p = lc("bootstrap", domain(), plist_path(s))
+        if p.returncode != 0 and not loaded(s):  # an installer may have loaded it already
+            raise FleetError("%s: launchctl bootstrap failed: %s" % (s["name"], (p.stderr or "").strip()))
+    lc("kickstart", target(s))
+
+
+def down(s):
+    if loaded(s):
+        lc("bootout", target(s))
+        for _ in range(10):  # bootout is asynchronous
+            if not loaded(s):
+                break
+            time.sleep(0.5)
+    lc("disable", target(s))
+
+
+def restart(s):
+    if not loaded(s):
+        raise FleetError("%s is not loaded (try: fleet up %s)" % (s["name"], s["name"]))
+    lc("kickstart", "-k", target(s))
+
+
+def reinstall(s):
+    if "adopt" in s and not s["adopt"].get("install"):
+        raise FleetError("%s: adopted without an install command; fleet will not delete its plist" % s["name"])
+    down(s)
+    try:
+        os.remove(plist_path(s))
+    except FileNotFoundError:
+        pass
+    up(s)
+
+
+# --------------------------------------------------------------------- status
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def http_code(s):
+    if not s.get("port"):
+        return "-"
+    url = "http://127.0.0.1:%d%s" % (s["port"], s.get("probe", "/"))
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(url, timeout=2) as r:
+            return str(r.status)
+    except urllib.error.HTTPError as e:
+        return str(e.code)
+    except Exception:
+        return "-"
+
+
+def status(svcs, out=sys.stdout):
+    if not svcs:
+        out.write("no services configured (fleet add, or fleet edit %s)\n" % config_path())
+        return
+    w = max([7] + [len(s["name"]) for s in svcs]) + 1
+    fmt = "%-" + str(w) + "s %-8s %-7s %-5s %s\n"
+    out.write(fmt % ("SERVICE", "STATE", "PID", "HTTP", "URL"))
+    for s in svcs:
+        state, pid = "off", ""
+        if not os.path.exists(plist_path(s)):
+            state = "absent"
+        info = lc_print(s)
+        if info is not None:
+            pid = pid_of(info)
+            state = "running" if pid else "loaded"
+        out.write(fmt % (s["name"], state, pid or "-", http_code(s), service_url(s) or "-"))
+
+
+def ls(svcs, out=sys.stdout):
+    w = max([4] + [len(s["name"]) for s in svcs]) + 1
+    g = max([5] + [len(s.get("group", "")) for s in svcs]) + 1
+    for s in svcs:
+        kind = "run" if "run" in s else "adopt"
+        port = str(s["port"]) if s.get("port") else "-"
+        out.write(("%-" + str(w) + "s %-" + str(g) + "s %-5s %-5s %s\n") % (
+            s["name"], s.get("group", "-"), kind, port, s["label"]))
+
+
+# ------------------------------------------------------------- add / adopt / rm
+
+def take(args, i, flag):
+    if i + 1 >= len(args):
+        raise FleetError("%s needs a value" % flag)
+    return args[i + 1]
+
+
+def parse_common(args, allowed):
+    """Parse --flag value options; returns (opts, positionals, argv-after---)."""
+    opts, pos, argv, i = {"env": []}, [], None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            argv = args[i + 1:]
+            break
+        if a.startswith("--") and "=" in a and a.split("=", 1)[0] in allowed:
+            a, v = a.split("=", 1)
+            args = args[:i] + [a, v] + args[i + 1:]
+        if a in ("--no-keep-alive", "--keep-plist"):
+            if a not in allowed:
+                raise FleetError("unknown option %s" % a)
+            opts[a] = True
+            i += 1
+        elif a.startswith("--"):
+            if a not in allowed:
+                raise FleetError("unknown option %s" % a)
+            v = take(args, i, a)
+            if a == "--env":
+                opts["env"].append(v)
+            else:
+                opts[a] = v
+            i += 2
+        else:
+            pos.append(a)
+            i += 1
+    return opts, pos, argv
+
+
+def apply_common(entry, opts):
+    if "--port" in opts:
+        try:
+            entry["port"] = int(opts["--port"])
+        except ValueError:
+            raise FleetError("--port must be a number")
+    for flag, key in (("--probe", "probe"), ("--log", "log"), ("--group", "group"),
+                      ("--url", "url"), ("--url-from-log", "url_from_log")):
+        if flag in opts:
+            entry[key] = opts[flag]
+
+
+def cmd_add(cfg, args):
+    allowed = {"--label", "--port", "--probe", "--log", "--group", "--url", "--url-from-log",
+               "--cwd", "--env", "--no-keep-alive", "--install"}
+    opts, pos, argv = parse_common(args, allowed)
+    if len(pos) != 1:
+        raise FleetError("usage: fleet add <name> [options] (--install \"<cmd>\" | -- <argv...>)")
+    name = pos[0]
+    if find(cfg, name):
+        raise FleetError("'%s' is already configured" % name)
+    if ("--install" in opts) == bool(argv):
+        raise FleetError("give exactly one of --install \"<cmd>\" or -- <argv...>")
+    entry = {"name": name, "label": opts.get("--label") or "local." + name}
+    apply_common(entry, opts)
+    if argv:
+        prog = argv[0] if "/" in argv[0] else shutil.which(argv[0])
+        if not prog:
+            raise FleetError("'%s' is not on PATH; give an absolute path" % argv[0])
+        run = {"argv": [prog] + argv[1:]}
+        if "--cwd" in opts:
+            run["cwd"] = opts["--cwd"]
+        if opts["env"]:
+            env = {}
+            for kv in opts["env"]:
+                if "=" not in kv:
+                    raise FleetError("--env wants KEY=VALUE, got '%s'" % kv)
+                k, v = kv.split("=", 1)
+                env[k] = v
+            run["env"] = env
+        if opts.get("--no-keep-alive"):
+            run["keepAlive"] = False
+        entry["run"] = run
+        if os.path.exists(plist_path(entry)):
+            raise FleetError("%s already exists; register it with: fleet adopt %s" % (
+                plist_path(entry), entry["label"]))
+    else:
+        if "--cwd" in opts or opts["env"] or opts.get("--no-keep-alive"):
+            raise FleetError("--cwd/--env/--no-keep-alive only apply to -- <argv> services")
+        entry["adopt"] = {"install": opts["--install"]}
+    cfg["services"].append(entry)
+    save_config(cfg)
+    print("added %s (%s); start it with: fleet up %s" % (name, entry["label"], name))
+
+
+def cmd_remove(cfg, args):
+    opts, pos, _ = parse_common(args, {"--keep-plist"})
+    if len(pos) != 1:
+        raise FleetError("usage: fleet remove <name> [--keep-plist]")
+    s = find(cfg, pos[0])
+    if not s:
+        raise FleetError("unknown service '%s'" % pos[0])
+    down(s)
+    cfg["services"] = [x for x in cfg["services"] if x is not s]
+    save_config(cfg)
+    path = plist_path(s)
+    if "run" in s and not opts.get("--keep-plist") and os.path.exists(path):
+        os.remove(path)
+        print("removed %s and deleted %s" % (s["name"], path))
+    else:
+        print("removed %s from the config (plist left at %s)" % (s["name"], path))
+
+
+def launchctl_labels():
+    p = lc("list")
+    labels = set()
+    for line in (p.stdout or "").splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) == 3:
+            labels.add(parts[2].strip())
+    return labels
+
+
+def cmd_adopt(cfg, args):
+    opts, pos, _ = parse_common(args, {"--name", "--port", "--probe", "--log", "--group",
+                                       "--url", "--url-from-log", "--install"})
+    if len(pos) != 1:
+        raise FleetError("usage: fleet adopt <label> [--name N] [--port N] [--probe /p] [--group G] [--install \"<cmd>\"]")
+    label = pos[0]
+    if any(s["label"] == label for s in cfg["services"]):
+        raise FleetError("%s is already managed by fleet" % label)
+    path = os.path.join(agents_dir(), label + ".plist")
+    on_disk = os.path.exists(path)
+    if not on_disk and label not in launchctl_labels():
+        raise FleetError("no LaunchAgent '%s' in launchctl list or %s" % (label, agents_dir()))
+    info = {}
+    if on_disk:
+        try:
+            with open(path, "rb") as f:
+                info = plistlib.load(f)
+        except Exception as e:
+            raise FleetError("cannot read %s: %s" % (path, e))
+        if info.get("Label") not in (None, label):
+            raise FleetError("%s has Label '%s', not '%s'" % (path, info.get("Label"), label))
+    name = opts.get("--name") or label.split(".")[-1]
+    if find(cfg, name):
+        raise FleetError("a service named '%s' exists; pass --name" % name)
+    entry = {"name": name, "label": label}
+    log = info.get("StandardErrorPath") or info.get("StandardOutPath")
+    if log:
+        entry["log"] = log.replace(HOME + "/", "~/", 1) if log.startswith(HOME + "/") else log
+    apply_common(entry, opts)
+    entry["adopt"] = {"install": opts["--install"]} if "--install" in opts else {}
+    cfg["services"].append(entry)
+    save_config(cfg)
+    print("adopted %s as '%s'%s" % (label, name, "" if on_disk else " (loaded, but no plist on disk)"))
+
+
+def cmd_edit():
+    path = config_path()
+    load_config(path)  # creates an empty config on first run
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    subprocess.call(shlex.split(editor) + [path])
+    load_config(path, migrate=False)
+    print("%s is valid" % path)
+
+
+# ----------------------------------------------------------------------- main
+
+def each(svcs, fn):
+    failed = False
+    for s in svcs:
+        try:
+            fn(s)
+        except FleetError as e:
+            sys.stderr.write("fleet: %s\n" % e)
+            failed = True
+    return failed
+
+
+def main(argv):
+    if os.geteuid() == 0:
+        raise FleetError("refusing to run as root; fleet manages your user LaunchAgents")
+    cmd = argv[0] if argv else "status"
+    args = argv[1:]
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if cmd == "edit":
+        cmd_edit()
+        return 0
+    cfg = load_config()
+    if cmd == "status":
+        status(resolve(cfg, args))
+    elif cmd == "ls":
+        ls(resolve(cfg, args))
+    elif cmd in ("up", "on", "start", "restart", "reinstall"):
+        svcs = resolve(cfg, args)
+        fn = {"restart": restart, "reinstall": reinstall}.get(cmd, up)
+        failed = each(svcs, fn)
+        time.sleep(settle())
+        status(svcs)
+        return 1 if failed else 0
+    elif cmd in ("down", "off", "stop"):
+        svcs = resolve(cfg, args)
+        failed = each(svcs, down)
+        status(svcs)
+        return 1 if failed else 0
+    elif cmd == "logs":
+        follow = "-f" in args
+        names = [a for a in args if a != "-f"]
+        if not names:
+            raise FleetError("usage: fleet logs <target...> [-f]")
+        logs = []
+        for s in resolve(cfg, names):
+            if not s.get("log"):
+                sys.stderr.write("fleet: %s has no \"log\" configured\n" % s["name"])
+            else:
+                logs.append(log_path(s))
+        if not logs:
+            return 1
+        os.execvp("tail", ["tail"] + (["-f"] if follow else ["-n", "60"]) + logs)
+    elif cmd in ("url", "open"):
+        if not args:
+            raise FleetError("usage: fleet %s <target...>" % cmd)
+        failed = False
+        for s in resolve(cfg, args):
+            u = service_url(s)
+            if not u:
+                sys.stderr.write("fleet: %s has no port or url\n" % s["name"])
+                failed = True
+            elif cmd == "url":
+                print(u)
+            else:
+                subprocess.call(["open", u])
+        return 1 if failed else 0
+    elif cmd == "add":
+        cmd_add(cfg, args)
+    elif cmd in ("remove", "rm"):
+        cmd_remove(cfg, args)
+    elif cmd == "adopt":
+        cmd_adopt(cfg, args)
+    else:
+        raise FleetError("unknown command '%s' (try: fleet help)" % cmd)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except FleetError as e:
+        sys.stderr.write("fleet: %s\n" % e)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)
